@@ -1,16 +1,19 @@
-import os
+import argparse
+
 import reverb
 import tempfile
-import portpicker
-import multiprocessing as mp
+import os
+import json
 import tensorflow as tf
+import time
 
 from tf_agents.agents.ddpg import critic_network
 from tf_agents.agents.sac import sac_agent
 from tf_agents.agents.sac import tanh_normal_projection_network
-from tf_agents.agents.dqn import dqn_agent
 
 # from tf_agents.environments import suite_pybullet
+from tf_agents.agents.dqn import dqn_agent
+
 from tf_agents.environments import suite_gym
 from tf_agents.environments import tf_py_environment
 
@@ -46,141 +49,139 @@ def main():
     # Hyperparams
     env_name = "CartPole-v0"
     num_iterations = 100000
-    lr = 3e-4
+    lr = 1e-4
     gamma = 0.99
     actor_fc_layer_params = (256, 256)
-    critic_fc_layer_params =(256, 256)
+    critic_fc_layer_params = (256, 256)
 
     log_interval = 5000
     num_eval_episodes = 20
     eval_interval = 10000
     policy_saved_interval = 5000
 
-    NUM_WORKERS = 3
-    NUM_PS = 2
+    NUM_WORKERS = 1
+    NUM_PS = 1
 
-    # Distribution Strategy
-    os.environ["GRPC_FAIL_FAST"] = "use_caller"
-    cluster_resolver = create_in_process_cluster(NUM_WORKERS, NUM_PS)
+    # Argument Parser
+    parser = argparse.ArgumentParser()
 
-    variable_partitioner = (
-        tf.distribute.experimental.partitioners.MinSizePartitioner(
-            min_shard_bytes=(256 << 10),
-            max_shards=NUM_PS
+    parser.add_argument('id', help="task id")
+    parser.add_argument('type', help="task type (chief, ps, worker)")
+    args = parser.parse_args()
+
+    # Cluster Configuration
+    task = {'type': args.type, 'index': args.id}
+
+    os.environ["TF_CONFIG"] = json.dumps({
+        "cluster": {
+            "ps": ['localhost:8000'],
+            "worker": ['localhost:8100', 'localhost:8101'],
+            "chief": ['localhost:8200']
+        },
+        'task': task
+    })
+
+    cluster_resolver = tf.distribute.cluster_resolver.TFConfigClusterResolver()
+
+
+    if cluster_resolver.task_type in ('worker', 'ps'):
+        # If Worker or PS: start a TF Server and wait
+        print('Starting TF Server..')
+        os.environ["GRPC_FAIL_FAST"] = "use_caller"
+
+        server = tf.distribute.Server(
+            cluster_resolver.cluster_spec(),
+            job_name=cluster_resolver.task_type,
+            task_index=cluster_resolver.task_id,
+            protocol=cluster_resolver.rpc_layer or "grpc",
+            start=True
         )
-    )
+        server.join()
 
-    strategy = tf.distribute.experimental.ParameterServerStrategy(
-        cluster_resolver,
-        variable_partitioner=variable_partitioner
-    )
-
-
-    # ClusterCoordinator
-    coordinator = tf.distribute.experimental.coordinator.ClusterCoordinator(strategy)
-
-
-    # Environment
-    train_py_env = suite_gym.load(env_name)
-    eval_py_env = suite_gym.load(env_name)
-
-    train_env = tf_py_environment.TFPyEnvironment(train_py_env)
-    eval_env = tf_py_environment.TFPyEnvironment(eval_py_env)
-
-
-    # Network
-    fc_layer_params = (100, 50)
-    action_tensor_spec = tensor_spec.from_spec(train_env.action_spec())
-    num_actions = action_tensor_spec.maximum - action_tensor_spec.minimum + 1
-
-    # Define a helper function to create Dense layers configured with the right
-    # activation and kernel initializer.
-    def dense_layer(num_units):
-        return tf.keras.layers.Dense(
-            num_units,
-            activation=tf.keras.activations.relu,
-            kernel_initializer=tf.keras.initializers.VarianceScaling(
-                scale=2.0, mode='fan_in', distribution='truncated_normal'))
-
-    # QNetwork consists of a sequence of Dense layers followed by a dense layer
-    # with `num_actions` units to generate one q_value per available action as
-    # it's output.
-    dense_layers = [dense_layer(num_units) for num_units in fc_layer_params]
-    q_values_layer = tf.keras.layers.Dense(
-        num_actions,
-        activation=None,
-        kernel_initializer=tf.keras.initializers.RandomUniform(
-            minval=-0.03, maxval=0.03),
-        bias_initializer=tf.keras.initializers.Constant(-0.2))
-    q_net = sequential.Sequential(dense_layers + [q_values_layer])
-
-
-    # Agent
-    optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
-
-    train_step_counter = tf.Variable(0)
-
-    agent = dqn_agent.DqnAgent(
-        train_env.time_step_spec(),
-        train_env.action_spec(),
-        q_network=q_net,
-        optimizer=optimizer,
-        td_errors_loss_fn=common.element_wise_squared_loss,
-        train_step_counter=train_step_counter)
-
-    agent.initialize()
-
-    # Worker step function
-    @tf.function
-    def run_ep():
-
-        env.reset()
-        # def run_step():
+    else:
+        # Run the Cluster Coordinator
+        print('Starting Coordinator..')
+        strategy = tf.distribute.experimental.ParameterServerStrategy(
+            cluster_resolver=cluster_resolver
+        )
+        coordinator = tf.distribute.experimental.coordinator.ClusterCoordinator(strategy)
 
 
 
+        # Environment
+        train_py_env = suite_gym.load(env_name)
+        eval_py_env = suite_gym.load(env_name)
 
-def create_in_process_cluster(num_workers, num_ps):
-    worker_ports = [portpicker.pick_unused_port() for _ in range(num_workers)]
-    ps_ports = [portpicker.pick_unused_port() for _ in range(num_ps)]
-    cluster_dict = {}
-    cluster_dict["worker"] = ["localhost:%s" % port for port in worker_ports]
-    if num_ps > 0:
-        cluster_dict["ps"] = ["localhost:%s" % port for port in ps_ports]
+        train_env = tf_py_environment.TFPyEnvironment(train_py_env)
+        eval_env = tf_py_environment.TFPyEnvironment(eval_py_env)
 
-    cluster_spec = tf.train.ClusterSpec(cluster_dict)
 
-    worker_config = tf.compat.v1.ConfigProto()
-    if mp.cpu_count() < num_workers + 1:
-        worker_config.inter_op_parallelism_threads = num_workers + 1
+        # Network
+        fc_layer_params = (100, 50)
+        action_tensor_spec = tensor_spec.from_spec(train_env.action_spec())
+        num_actions = action_tensor_spec.maximum - action_tensor_spec.minimum + 1
 
-    # Définition d'un tf.distribute.Server pour chaque Worker et Parameter Server
-    # Les serveurs appartenant à un même cluster peuvent communiquer les uns avec les autres
-    for i in range(num_workers):
-        tf.distribute.Server(
-            cluster_spec,
-            job_name="worker",
-            task_index=i,
-            config=worker_config,
-            protocol="grpc"
+        def dense_layer(num_units):
+            return tf.keras.layers.Dense(
+                num_units,
+                activation=tf.keras.activations.relu,
+                kernel_initializer=tf.keras.initializers.VarianceScaling(
+                    scale=2.0, mode='fan_in', distribution='truncated_normal'
+                )
+            )
+
+        dense_layer = [dense_layer(num_units) for num_units in fc_layer_params]
+        q_values_layer = tf.keras.layers.Dense(
+            num_actions,
+            activation=None,
+            kernel_initializer=tf.keras.initializers.RandomUniform(
+                minval=-0.03, maxval=0.03
+            ),
+            bias_initializer=tf.keras.initializers.Constant(-0.2)
+        )
+        q_net = sequential.Sequential(dense_layer + [q_values_layer])
+
+
+        # Agent
+        optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+
+        train_step_counter = tf.Variable(0)
+
+        agent = dqn_agent.DqnAgent(
+            train_env.time_step_spec(),
+            train_env.action_spec(),
+            q_network=q_net,
+            optimizer=optimizer,
+            td_errors_loss_fn=common.element_wise_squared_loss,
+            train_step_counter=train_step_counter
         )
 
-    for i in range(num_ps):
-        tf.distribute.Server(
-            cluster_spec,
-            job_name="ps",
-            task_index=i,
-            protocol="grpc"
-        )
+        agent.initialize()
 
-    cluster_resolver = tf.distribute.cluster_resolver.SimpleClusterResolver(
-        cluster_spec,
-        rpc_layer="grpc"
-    )
+        with strategy.scope():
+            v1 = tf.Variable(initial_value=0.0)
+            v2 = tf.Variable(initial_value=1.0)
 
-    return cluster_resolver
+        # Worker step function
+        @tf.function
+        def run_ep():
+            v1.assign_add(0.1)
+            v2.assign_sub(0.1)
+            return v1.read_value() / v2.read_value()
 
+        start = time.time()
+        result = 0
+        for _ in range(10000):
+            result = coordinator.schedule(run_ep)
+
+        coordinator.join()
+        print(result.fetch())
+        end = time.time()
+        print(f'time: {end - start}')
+
+
+# Instruction for running
+# python dist_agent.py <task_id> <task_type>
 
 if __name__ == '__main__':
     main()
-
